@@ -1,0 +1,538 @@
+from machine import Pin, PWM, time_pulse_us
+import time
+
+# ==================== PINES ====================
+trig = Pin(25, Pin.OUT)
+echo = Pin(26, Pin.IN)
+ventilador = PWM(Pin(27), freq=1000)
+ventilador.duty(0)
+
+# ==================== CONSTANTES FÍSICAS ====================
+MASA_BOLA = 0.00055          # kg (0.55 g)
+GRAVEDAD = 9.81              # m/s²
+DIAMETRO_BOLA = 0.03         # 3 cm
+LARGO_TUBO = 0.38            # 38 cm
+POS_MIN = 0.0
+POS_MAX = (LARGO_TUBO - DIAMETRO_BOLA) * 100  # 35 cm
+
+# ==================== FÍSICAS DEL VENTILADOR ====================
+EMPUJE_MAX_N  = 0.028        # 28 mN (estimado)
+PESO_BOLA_N   = MASA_BOLA * GRAVEDAD
+PWM_HOVER_EST = int(1023 * (PESO_BOLA_N / EMPUJE_MAX_N) ** 0.5)
+
+# ==================== PWM DE ARRANQUE ====================
+PWM_ARRANQUE = 880
+
+# ==================== CALIBRACIÓN SENSOR → POSICIÓN ====================
+SENSOR_A_FISICA = {
+    35.6: 0.00,
+    31.0: 6.33,
+    27.0: 12.67,
+    22.0: 19.00,
+    18.0: 25.33,
+    14.0: 31.67,
+    10.0: 38.00,
+}
+ult_sensor = max(SENSOR_A_FISICA.keys())
+ult_pos = SENSOR_A_FISICA[ult_sensor]
+if ult_pos > POS_MAX:
+    factor = POS_MAX / ult_pos
+    SENSOR_A_FISICA = {k: v * factor for k, v in SENSOR_A_FISICA.items()}
+
+def sensor_a_posicion_real(lectura):
+    pts = sorted(SENSOR_A_FISICA.keys())
+    if lectura >= pts[-1]:
+        return min(POS_MAX, SENSOR_A_FISICA[pts[-1]])
+    if lectura <= pts[0]:
+        return max(POS_MIN, SENSOR_A_FISICA[pts[0]])
+    for i in range(len(pts)-1):
+        if pts[i] <= lectura <= pts[i+1]:
+            x1, y1 = pts[i], SENSOR_A_FISICA[pts[i]]
+            x2, y2 = pts[i+1], SENSOR_A_FISICA[pts[i+1]]
+            return y1 + (lectura - x1) * (y2 - y1) / (x2 - x1)
+    return max(POS_MIN, min(POS_MAX, SENSOR_A_FISICA[pts[0]]))
+
+def posicion_real_a_sensor(pos):
+    pos = max(POS_MIN, min(POS_MAX, pos))
+    pts = sorted([(v, k) for k, v in SENSOR_A_FISICA.items()])
+    if pos <= pts[0][0]:
+        return pts[0][1]
+    if pos >= pts[-1][0]:
+        return pts[-1][1]
+    for i in range(len(pts)-1):
+        if pts[i][0] <= pos <= pts[i+1][0]:
+            x1, y1 = pts[i][0], pts[i][1]
+            x2, y2 = pts[i+1][0], pts[i+1][1]
+            return y1 + (pos - x1) * (y2 - y1) / (x2 - x1)
+    return pts[0][1]
+
+# ==================== PARÁMETROS DEL SISTEMA ====================
+PWM_MIN = 150
+PWM_MAX = 1023
+SIN_LECTURA_MAX = 20
+
+# ==================== PID AJUSTADO ====================
+Kp = 0.8
+Ki = 0.15          # ↑ aumentada para eliminar error estático
+Kd = 3.0           # ↓ reducida para evitar picos
+ZONA_MUERTA = 0.5
+LIMITE_SALIDA = 6
+
+# Variables PID
+error_integral = 0.0
+error_anterior = 0.0
+ultimo_tiempo = time.ticks_us()
+# Buffer de derivada ampliado a 5 puntos (para un filtrado más suave)
+deriv_buffer = [0.0, 0.0, 0.0, 0.0, 0.0]
+deriv_idx = 0
+
+# ==================== FILTRO DE LECTURA ====================
+VENTANA = 7
+historial = []
+
+def medir_raw():
+    trig.off()
+    time.sleep_us(2)
+    trig.on()
+    time.sleep_us(10)
+    trig.off()
+    duracion = time_pulse_us(echo, 1, 30000)
+    if duracion < 0:
+        return None
+    return (duracion * 0.0343) / 2
+
+def medir_distancia():
+    global historial
+    d = medir_raw()
+    if d is None or d < 1.0 or d > 38.0:
+        return None
+    historial.append(d)
+    if len(historial) > VENTANA:
+        historial.pop(0)
+    if len(historial) < 3:
+        return d
+    ordenado = sorted(historial)
+    return ordenado[len(ordenado)//2]
+
+# ==================== CONTROL PID MEJORADO ====================
+def control_pid(error, pwm_actual):
+    global error_integral, error_anterior, ultimo_tiempo, deriv_buffer, deriv_idx
+
+    ahora = time.ticks_us()
+    dt = time.ticks_diff(ahora, ultimo_tiempo) / 1e6
+    if dt > 0.1:
+        dt = 0.05
+    ultimo_tiempo = ahora
+
+    P = Kp * error
+
+    # Integral con anti-windup: solo integrar si PWM no está saturado
+    if PWM_MIN < pwm_actual < PWM_MAX:
+        error_integral += error * dt
+    # Limitar la contribución máxima de la integral a ±150 unidades de PWM
+    max_integral_effect = 150.0
+    error_integral = max(-max_integral_effect / Ki, min(max_integral_effect / Ki, error_integral))
+    I = Ki * error_integral
+
+    # Derivativa con filtrado (buffer de 5 puntos)
+    deriv_raw = (error - error_anterior) / dt if dt > 0 else 0
+    deriv_buffer[deriv_idx] = deriv_raw
+    deriv_idx = (deriv_idx + 1) % len(deriv_buffer)
+    deriv_filtrada = sum(deriv_buffer) / len(deriv_buffer)
+    D = Kd * deriv_filtrada
+
+    error_anterior = error
+
+    salida = P + I + D
+    if salida > LIMITE_SALIDA:
+        salida = LIMITE_SALIDA
+    elif salida < -LIMITE_SALIDA:
+        salida = -LIMITE_SALIDA
+
+    return salida
+
+def reiniciar_pid():
+    global error_integral, error_anterior, ultimo_tiempo, deriv_buffer, deriv_idx
+    error_integral = 0.0
+    error_anterior = 0.0
+    ultimo_tiempo = time.ticks_us()
+    deriv_buffer = [0.0, 0.0, 0.0, 0.0, 0.0]
+    deriv_idx = 0
+
+# ==================== FEED-FORWARD (PWM base según altura) ====================
+def pwm_feedforward(setpoint_cm):
+    """Retorna el PWM estimado necesario para mantener la bola en setpoint_cm.
+       Valores calibrados experimentalmente (basado en observación real)."""
+    hover_map = {
+        5:  800,
+        10: 860,
+        15: 920,
+        18: 960,    # ← valor real medido para 18 cm
+        20: 980,
+        25: 1020,
+        30: 1023,
+        35: 1023
+    }
+    puntos = sorted(hover_map.items())
+    if setpoint_cm <= puntos[0][0]:
+        return puntos[0][1]
+    if setpoint_cm >= puntos[-1][0]:
+        return puntos[-1][1]
+    for i in range(len(puntos)-1):
+        if puntos[i][0] <= setpoint_cm <= puntos[i+1][0]:
+            x1, y1 = puntos[i]
+            x2, y2 = puntos[i+1]
+            return y1 + (setpoint_cm - x1) * (y2 - y1) / (x2 - x1)
+    return 960   # valor por defecto
+
+# ==================== REGISTRO DE DATOS ====================
+datos_registro = []
+inicio_tiempo = time.ticks_ms()
+
+def registrar_dato(pos, setp, pwm, err, deriv):
+    t = time.ticks_diff(time.ticks_ms(), inicio_tiempo)
+    datos_registro.append((t, pos, setp, pwm, err, deriv))
+
+def guardar_csv():
+    try:
+        with open("datos_levitacion.csv", "w") as f:
+            f.write("tiempo_ms,posicion_cm,setpoint_cm,pwm,error_cm,derivada\n")
+            for t, pos, setp, pwm, err, deriv in datos_registro:
+                f.write(f"{t},{pos:.2f},{setp:.2f},{pwm},{err:.2f},{deriv:.2f}\n")
+        print("\nDatos guardados en 'datos_levitacion.csv'")
+    except Exception as e:
+        print(f"\nNo se pudo guardar CSV: {e}")
+
+# ==================== ESTIMACIÓN FÍSICA ====================
+_pos_ant_fisica = None
+_vel_ant_fisica = 0.0
+_t_ant_fisica   = None
+_vel_buf_fisica = [0.0, 0.0, 0.0]
+_vel_buf_idx    = 0
+
+def estimar_fisica(pos_actual_cm):
+    global _pos_ant_fisica, _vel_ant_fisica, _t_ant_fisica
+    global _vel_buf_fisica, _vel_buf_idx
+    ahora = time.ticks_us()
+    if _pos_ant_fisica is None or _t_ant_fisica is None:
+        _pos_ant_fisica = pos_actual_cm
+        _t_ant_fisica   = ahora
+        return 0.0, 0.0, PESO_BOLA_N * 1000.0
+    dt = time.ticks_diff(ahora, _t_ant_fisica) / 1e6
+    if dt <= 0.001:
+        return 0.0, 0.0, PESO_BOLA_N * 1000.0
+    vel = (pos_actual_cm - _pos_ant_fisica) / dt
+    _vel_buf_fisica[_vel_buf_idx] = vel
+    _vel_buf_idx = (_vel_buf_idx + 1) % len(_vel_buf_fisica)
+    vel_suave = sum(_vel_buf_fisica) / len(_vel_buf_fisica)
+    acel = (vel_suave - _vel_ant_fisica) / dt
+    a_ms2 = acel / 100.0
+    fuerza_mN = MASA_BOLA * (a_ms2 + GRAVEDAD) * 1000.0
+    _pos_ant_fisica = pos_actual_cm
+    _vel_ant_fisica = vel_suave
+    _t_ant_fisica   = ahora
+    return vel_suave, acel, fuerza_mN
+
+def resetear_fisica():
+    global _pos_ant_fisica, _vel_ant_fisica, _t_ant_fisica
+    global _vel_buf_fisica, _vel_buf_idx
+    _pos_ant_fisica = None
+    _vel_ant_fisica = 0.0
+    _t_ant_fisica   = None
+    _vel_buf_fisica = [0.0, 0.0, 0.0]
+    _vel_buf_idx    = 0
+
+# ==================== REPORTE CONSOLA ====================
+def reporte_consola():
+    if not datos_registro:
+        print("\nNo hay datos registrados.")
+        return
+    print("\n" + "="*60)
+    print("RESUMEN DE DESEMPEÑO")
+    print("="*60)
+    print(f"Peso bola:         {PESO_BOLA_N*1000:.2f} mN  ({MASA_BOLA*1000:.2f} g)")
+    print(f"Empuje max. est.:  {EMPUJE_MAX_N*1000:.1f} mN  (ventilador 12V 40x40x10mm)")
+    print(f"PWM hover teorico: {PWM_HOVER_EST} / {PWM_MAX}  ({PWM_HOVER_EST/PWM_MAX*100:.1f}%)")
+    print(f"PWM arranque real: {PWM_ARRANQUE} / {PWM_MAX}  ({PWM_ARRANQUE/PWM_MAX*100:.1f}%)")
+    print(f"Rango posicion:    {POS_MIN:.1f} cm  a  {POS_MAX:.1f} cm")
+
+    cambios = []
+    set_ant = None
+    t_ant = None
+    for t, pos, setp, pwm, err, deriv in datos_registro:
+        if setp != set_ant:
+            if set_ant is not None:
+                cambios.append((t_ant, t, set_ant))
+            set_ant = setp
+            t_ant = t
+    if set_ant is not None:
+        cambios.append((t_ant, datos_registro[-1][0], set_ant))
+
+    for idx, (t_start, t_end, setpoint) in enumerate(cambios):
+        segmento = [(t, pos, setp, pwm, err, deriv)
+                    for t, pos, setp, pwm, err, deriv in datos_registro
+                    if t_start <= t <= t_end]
+        if len(segmento) < 2:
+            continue
+
+        pos_ini = segmento[0][1]
+        delta   = setpoint - pos_ini
+
+        t_settle = t_end
+        for t, pos, setp, pwm, err, deriv in reversed(segmento):
+            if abs(pos - setpoint) > 0.5:
+                break
+            t_settle = t
+        tiempo_establecimiento = t_settle - t_start
+
+        t10 = t90 = None
+        if delta != 0:
+            nivel_10 = pos_ini + 0.1 * delta
+            nivel_90 = pos_ini + 0.9 * delta
+            for t, pos, setp, pwm, err, deriv in segmento:
+                if t10 is None and pos >= nivel_10:
+                    t10 = t
+                if t90 is None and pos >= nivel_90:
+                    t90 = t
+        tiempo_subida = (t90 - t10) if (t10 and t90) else 0
+
+        overshoot = max(0, max(f[1] for f in segmento) - setpoint)
+
+        derivadas = [abs(f[5]) for f in segmento]
+        deriv_max  = max(derivadas) if derivadas else 0
+        deriv_prom = sum(derivadas) / len(derivadas) if derivadas else 0
+
+        aceleracion_estimada = 0.0
+        if len(segmento) > 5:
+            v_ant_r = 0.0
+            t_ant_r = segmento[0][0]
+            for i in range(1, 5):
+                t_act   = segmento[i][0]
+                pos_act = segmento[i][1]
+                dt_r    = (t_act - t_ant_r) / 1000.0
+                if dt_r > 0:
+                    v_act_r = (pos_act - segmento[i-1][1]) / 100.0 / dt_r
+                    aceleracion_estimada = (v_act_r - v_ant_r) / dt_r
+                    v_ant_r = v_act_r
+                    t_ant_r = t_act
+
+        hover_pts = [f for f in segmento if abs(f[4]) < 1.0]
+        if hover_pts:
+            pwm_hover_real = sum(f[3] for f in hover_pts) / len(hover_pts)
+            ratio_pwm      = (pwm_hover_real / PWM_MAX) ** 2
+            fuerza_pwm_mN  = ratio_pwm * EMPUJE_MAX_N * 1000.0
+        else:
+            pwm_hover_real = 0.0
+            fuerza_pwm_mN  = 0.0
+
+        print(f"\nSetpoint {setpoint:.1f} cm  (Delta = {delta:+.1f} cm desde {pos_ini:.1f} cm):")
+        print(f"  Tiempo de subida (10->90%):           {tiempo_subida} ms")
+        print(f"  Tiempo de establecimiento (+-0.5cm):  {tiempo_establecimiento} ms")
+        print(f"  Overshoot:                            {overshoot:.2f} cm")
+        print(f"  Aceleracion pico estimada:            {aceleracion_estimada:.3f} m/s2")
+        print(f"  Fuerza ventilador en hover:")
+        print(f"    -> Por balance (m*g):               {PESO_BOLA_N*1000:.2f} mN")
+        print(f"    -> Por PWM ({pwm_hover_real:.0f}/{PWM_MAX}):             {fuerza_pwm_mN:.2f} mN")
+        print(f"  Derivada del error -- max: {deriv_max:.2f}  prom: {deriv_prom:.2f}")
+
+    print("\n" + "="*60)
+
+# ==================== FUNCIÓN PARA INGRESAR POSICIONES ====================
+def pedir_posiciones():
+    print("\nIngrese las posiciones deseadas (cm) separadas por comas.")
+    print(f"Rango valido: {POS_MIN:.1f} a {POS_MAX:.1f} cm.")
+    entrada = input("Ejemplo: 10, 20, 35: ").strip()
+    if not entrada:
+        return None
+    try:
+        posiciones = [float(x.strip()) for x in entrada.split(',')]
+        posiciones = [max(POS_MIN, min(POS_MAX, p)) for p in posiciones]
+        return posiciones
+    except:
+        print("Entrada invalida. Usando lista por defecto.")
+        return None
+
+# ==================== PEDIR LÍMITES ====================
+def pedir_limites():
+    print(f"\nLimite minimo de posicion [{POS_MIN:.1f} cm por defecto]: ", end="")
+    try:
+        ent = input().strip()
+        lim_min = float(ent) if ent else POS_MIN
+        lim_min = max(POS_MIN, lim_min)
+    except:
+        lim_min = POS_MIN
+    print(f"Limite maximo de posicion [{POS_MAX:.1f} cm por defecto]: ", end="")
+    try:
+        ent = input().strip()
+        lim_max = float(ent) if ent else POS_MAX
+        lim_max = min(POS_MAX, lim_max)
+    except:
+        lim_max = POS_MAX
+    if lim_min >= lim_max:
+        print("Limites invalidos. Usando valores por defecto.")
+        return POS_MIN, POS_MAX
+    print(f"Limites configurados: [{lim_min:.1f}, {lim_max:.1f}] cm")
+    return lim_min, lim_max
+
+# ==================== PROGRAMA PRINCIPAL ====================
+print("=" * 60)
+print("   LEVITADOR PROFESIONAL - CONTROL PID CON ANALISIS")
+print("   Config: ventilador ABAJO | sensor ARRIBA")
+print("=" * 60)
+print(f"Limites fisicos: {POS_MIN:.1f} cm (fondo) a {POS_MAX:.1f} cm (tope)")
+print(f"Masa: {MASA_BOLA*1000:.2f} g | Peso: {PESO_BOLA_N*1000:.2f} mN")
+print(f"PWM hover estimado: {PWM_HOVER_EST} | PWM arranque: {PWM_ARRANQUE}")
+
+lim_min_usuario, lim_max_usuario = pedir_limites()
+
+posiciones_usuario = pedir_posiciones()
+if posiciones_usuario is None:
+    posiciones_usuario = [10.0, 20.0, 30.0]
+posiciones_usuario = [max(lim_min_usuario, min(lim_max_usuario, p))
+                      for p in posiciones_usuario]
+print(f"Secuencia de setpoints: {posiciones_usuario} cm")
+
+# Ajuste de PID y PWM de arranque
+try:
+    print(f"\nPID actual: Kp={Kp}  Ki={Ki}  Kd={Kd}")
+    print(f"PWM arranque actual: {PWM_ARRANQUE}")
+    print("Modificar? (Kp Ki Kd PWM_arranque) [Enter para mantener]")
+    ajuste = input("Ejemplo: 0.6 0.005 9.0 880: ").strip()
+    if ajuste:
+        vals = list(map(float, ajuste.split()))
+        Kp, Ki, Kd = vals[0], vals[1], vals[2]
+        if len(vals) >= 4:
+            PWM_ARRANQUE = int(vals[3])
+        print(f"Nuevos valores: Kp={Kp}, Ki={Ki}, Kd={Kd}, PWM_arranque={PWM_ARRANQUE}")
+except:
+    pass
+
+# ==================== ARRANQUE ====================
+print(f"\nFase 1: Subida rapida a PWM de arranque ({PWM_ARRANQUE})...")
+for pwm_r in range(0, PWM_ARRANQUE, 40):
+    ventilador.duty(pwm_r)
+    time.sleep_us(800)
+ventilador.duty(PWM_ARRANQUE)
+time.sleep(1.2)
+
+print("Fase 2: Detectando bola...")
+pwm_actual = float(PWM_ARRANQUE)
+bola_detectada = False
+for intento in range(40):
+    d = medir_distancia()
+    if d:
+        pos = sensor_a_posicion_real(d)
+        print(f"   PWM: {int(pwm_actual):4d} | Sensor: {d:4.1f}cm | Pos: {pos:4.1f}cm")
+        if pos > 2.0:
+            print("   Bola detectada")
+            bola_detectada = True
+            break
+    time.sleep(0.1)
+
+if not bola_detectada:
+    pwm_actual = float(PWM_ARRANQUE - 60)
+    ventilador.duty(int(pwm_actual))
+    time.sleep(0.5)
+
+print("Fase 3: Control fino")
+time.sleep(0.3)
+print("=" * 60)
+print("  POS(cm) | SETP(cm) | PWM  | ERROR | DERIV | VEL(cm/s) | ACEL(cm/s2) | F_fan(mN)")
+print("-" * 88)
+
+indice_setpoint = 0
+POS_DESEADA = posiciones_usuario[indice_setpoint]
+reiniciar_pid()
+resetear_fisica()
+error_integral = 0.0
+error_anterior = 0.0
+ultimo_tiempo = time.ticks_us()
+deriv_buffer = [0.0, 0.0, 0.0, 0.0, 0.0]
+deriv_idx = 0
+ciclos_sin_lectura = 0
+ciclos_estable = 0
+CICLOS_PARA_CAMBIAR = 100
+
+t_inicio_setpoint = time.ticks_ms()
+setpoint_alcanzado = False
+
+# Inicializar PWM con feedforward según el primer setpoint
+pwm_actual = pwm_feedforward(POS_DESEADA)
+ventilador.duty(int(pwm_actual))
+
+try:
+    while True:
+        lectura = medir_distancia()
+
+        if lectura is not None:
+            ciclos_sin_lectura = 0
+            pos_actual = sensor_a_posicion_real(lectura)
+
+            # Límites de seguridad
+            if pos_actual < lim_min_usuario - 0.5:
+                pwm_actual = min(pwm_actual + 20, PWM_MAX)
+                ventilador.duty(int(pwm_actual))
+                time.sleep(0.05)
+                continue
+            if pos_actual > lim_max_usuario + 0.5:
+                pwm_actual = max(pwm_actual - 20, PWM_MIN)
+                ventilador.duty(int(pwm_actual))
+                time.sleep(0.05)
+                continue
+
+            error = POS_DESEADA - pos_actual
+            delta = control_pid(error, pwm_actual)
+            pwm_actual += delta
+            pwm_actual = max(PWM_MIN, min(PWM_MAX, pwm_actual))
+            ventilador.duty(int(pwm_actual))
+
+            deriv_actual = deriv_buffer[(deriv_idx-1) % len(deriv_buffer)]
+            vel, acel, fuerza_mN = estimar_fisica(pos_actual)
+
+            if not setpoint_alcanzado and abs(error) < ZONA_MUERTA:
+                t_llegada = time.ticks_diff(time.ticks_ms(), t_inicio_setpoint)
+                print(f"\n  >>> SETPOINT {POS_DESEADA:.1f}cm alcanzado en {t_llegada} ms <<<\n")
+                setpoint_alcanzado = True
+
+            print(f"{pos_actual:7.1f}cm | {POS_DESEADA:6.1f}cm | {int(pwm_actual):5d} | "
+                  f"{error:+5.2f} | {deriv_actual:+6.2f} | "
+                  f"{vel:+8.1f} | {acel:+10.1f} | {fuerza_mN:8.2f}")
+
+            registrar_dato(pos_actual, POS_DESEADA, int(pwm_actual), error, deriv_actual)
+
+            if abs(error) < ZONA_MUERTA:
+                ciclos_estable += 1
+            else:
+                ciclos_estable = 0
+
+            # Cambio de setpoint si está estable y hay más
+            if ciclos_estable >= CICLOS_PARA_CAMBIAR and indice_setpoint + 1 < len(posiciones_usuario):
+                indice_setpoint += 1
+                POS_DESEADA = posiciones_usuario[indice_setpoint]
+                reiniciar_pid()
+                resetear_fisica()
+                ciclos_estable = 0
+                setpoint_alcanzado = False
+                t_inicio_setpoint = time.ticks_ms()
+                # Aplicar feedforward al nuevo setpoint
+                pwm_actual = pwm_feedforward(POS_DESEADA)
+                ventilador.duty(int(pwm_actual))
+                print(f"\n--- CAMBIANDO A SETPOINT {POS_DESEADA:.1f} cm ---\n")
+
+        else:
+            ciclos_sin_lectura += 1
+            if ciclos_sin_lectura > SIN_LECTURA_MAX:
+                pwm_actual = max(PWM_MIN, pwm_actual - 2)
+                ventilador.duty(int(pwm_actual))
+                print(f"   SIN SEÑAL | PWM reducido a {int(pwm_actual)}")
+            else:
+                print(f"   Esperando ({ciclos_sin_lectura}/{SIN_LECTURA_MAX})")
+
+        time.sleep(0.05)
+
+except KeyboardInterrupt:
+    print("\n\nDeteniendo...")
+    ventilador.duty(0)
+    guardar_csv()
+    reporte_consola()
+    print("Ventilador apagado.")
